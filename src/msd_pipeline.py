@@ -56,7 +56,9 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
     negatives = labelled.filter("label = 0")
     negative_fraction = min(1.0, positives.count() / max(negatives.count(), 1))
     balanced = positives.unionByName(negatives.sample(False, negative_fraction, SEED))
-    features = nonzero_numeric_columns(balanced)
+    # The target is numeric, so exclude it explicitly before assembling model
+    # inputs. Including it would leak the answer into every classifier.
+    features = [column for column in nonzero_numeric_columns(balanced) if column != "label"]
     if model_name == "lr":
         assembler = VectorAssembler(inputCols=features, outputCol="features_raw", handleInvalid="skip")
         stages = [assembler, StandardScaler(inputCol="features_raw", outputCol="features", withMean=False), LogisticRegression(maxIter=100, seed=SEED)]
