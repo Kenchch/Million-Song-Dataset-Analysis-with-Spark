@@ -7,7 +7,7 @@ from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
 from pyspark.sql import SparkSession, functions as F
 
-from src.msd_pipeline import SEED, recommend_unseen, userwise_split
+from src.msd_pipeline import SEED, clean_triplets, recommend_unseen, train_als, userwise_split
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +34,49 @@ def indexed(spark):
 
 def _pairs(frame):
     return {(row.user_idx, row.song_idx) for row in frame.select("user_idx", "song_idx").collect()}
+
+
+@pytest.mark.parametrize("payload", [
+    "u1\ts1\t1\nu1\ts1\t2\n", "u1\ts1\tNaN\n",
+    "u1\ts1\tInfinity\n", "u1\ts1\t-1\n", "u1\ts1\t0\n",
+    "u1\ts1\tbad\n", "\ts1\t1\n",
+])
+def test_invalid_triplets_are_rejected(spark, tmp_path, payload):
+    path = tmp_path / "invalid.tsv"
+    path.write_text(payload)
+    with pytest.raises(ValueError):
+        clean_triplets(spark, str(path), 1, 1)
+
+
+def test_small_histories_keep_a_holdout(spark):
+    frame = spark.createDataFrame([("u1", "s1"), ("u1", "s2"), ("u2", "s3")],
+                                  ["user_id", "song_id"])
+    train, test = userwise_split(frame)
+    assert train.count() == 2
+    assert [(r.user_id) for r in test.collect()] == ["u1"]
+    for fraction in [0, 1, -0.1, float("nan")]:
+        with pytest.raises(ValueError):
+            userwise_split(frame, fraction)
+
+
+def test_exported_recommendations_resolve_to_source_ids(spark, tmp_path):
+    path = tmp_path / "triplets.tsv"
+    path.write_text("".join(f"u{u}\ts{(u+i)%12}\t{i+1}\n"
+                            for u in range(8) for i in range(6)))
+    output = str(tmp_path / "output")
+    train_als(spark, str(path), output, 1, 1)
+    from pyspark.ml import PipelineModel
+    restored = PipelineModel.load(f"{output}/indexers")
+    users = spark.read.parquet(f"{output}/user_mapping")
+    songs = spark.read.parquet(f"{output}/song_mapping")
+    recommendations = spark.read.parquet(f"{output}/recommendations")
+    assert users.count() == 8
+    assert songs.count() == 12
+    decoded = recommendations.join(users, "user_idx").join(songs, "song_idx")
+    assert decoded.count() == recommendations.count() > 0
+    reindexed = restored.transform(decoded.select("user_id", "song_id"))
+    assert reindexed.select("user_idx", "song_idx").exceptAll(
+        recommendations.select("user_idx", "song_idx")).count() == 0
 
 
 class TestUserwiseSplit:

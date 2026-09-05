@@ -92,6 +92,28 @@ spark-submit src/msd_pipeline.py train-als \
 
 ## Reproducibility choices
 
+### ALS input and export contract
+
+Taste Profile input must contain one row per `(user_id, song_id)`, nonempty IDs,
+and finite positive play counts. The loader rejects invalid or duplicate pairs
+before filtering or splitting. It does not sum duplicates: an overlapping input
+file must not silently double implicit-feedback confidence. These checks add
+an input scan and a pair-count shuffle to ingestion.
+
+The user-wise split retains a training item for every user and a held-out item
+for users with at least two retained songs; single-song users remain training-only.
+The activity filters are a single pass, so filtering songs can leave a user with
+fewer songs than the initial user threshold. This is not iterative k-core filtering.
+
+The ALS output includes `indexers/` (the fitted Spark indexing pipeline),
+`user_mapping/` and `song_mapping/` Parquet tables alongside `model/`,
+`recommendations/` and `test_interactions/`. Join recommendation indices to these
+mapping tables to recover source IDs; do not refit indexers to decode an old run.
+The files are written sequentially, so use a fresh output directory for each run;
+this export is not an atomic publication mechanism.
+
+### Evaluation and CI
+
 - The attributes CSV drives explicit Spark schemas; feature files are not inferred.
 - Binary classifiers use a deterministic random seed and save their fitted Spark pipeline.
 - Genre data is split before balancing; only the training partition is downsampled and used to select features. The held-out partition retains its original class mix. Logistic regression uses its deterministic optimizer; the split and stochastic tree models use explicit seeds.

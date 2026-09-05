@@ -81,9 +81,21 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
 
 
 def clean_triplets(spark: SparkSession, triplets_path: str, min_user_items: int, min_song_users: int) -> DataFrame:
+    if min_user_items < 1 or min_song_users < 1:
+        raise ValueError("activity thresholds must be positive")
     interactions = spark.read.option("sep", "\t").option("header", "false").csv(triplets_path).select(
-        F.col("_c0").alias("user_id"), F.col("_c1").alias("song_id"), F.col("_c2").cast("float").alias("play_count")
+        F.col("_c0").alias("user_id"), F.col("_c1").alias("song_id"), F.col("_c2").cast("double").alias("play_count")
     )
+    invalid = interactions.filter(
+        F.col("user_id").isNull() | (F.trim("user_id") == "")
+        | F.col("song_id").isNull() | (F.trim("song_id") == "")
+        | F.col("play_count").isNull() | F.isnan("play_count")
+        | (F.col("play_count") <= 0) | (F.col("play_count") == float("inf"))
+    )
+    if invalid.limit(1).count():
+        raise ValueError("triplets require nonempty IDs and finite positive play counts")
+    if interactions.groupBy("user_id", "song_id").count().filter("count > 1").limit(1).count():
+        raise ValueError("duplicate user/song pairs: resolve overlapping input before splitting")
     active_users = interactions.groupBy("user_id").agg(F.countDistinct("song_id").alias("item_count")).filter(F.col("item_count") >= min_user_items)
     active_songs = interactions.groupBy("song_id").agg(F.countDistinct("user_id").alias("user_count")).filter(F.col("user_count") >= min_song_users)
     return interactions.join(active_users.select("user_id"), "user_id").join(active_songs.select("song_id"), "song_id")
@@ -100,11 +112,15 @@ def userwise_split(interactions: DataFrame, train_fraction: float = 0.8) -> tupl
     both halves or in neither. The first case leaks training rows into the
     held-out set; the second drops them silently.
     """
+    if not 0 < train_fraction < 1:
+        raise ValueError("train_fraction must be between zero and one")
     ordering = F.hash(F.concat_ws("\u0000", F.col("user_id"), F.col("song_id"), F.lit(SEED)))
     ranked = interactions.withColumn("_order", ordering).withColumn(
         "_rank", F.row_number().over(Window.partitionBy("user_id").orderBy("_order", "song_id"))
     ).withColumn("_count", F.count("*").over(Window.partitionBy("user_id")))
-    cutoff = F.ceil(F.col("_count") * train_fraction)
+    cutoff = F.greatest(F.lit(1), F.least(
+        F.ceil(F.col("_count") * train_fraction), F.col("_count") - 1
+    ))
     columns = interactions.columns
     return (
         ranked.filter(F.col("_rank") <= cutoff).select(*columns),
@@ -143,7 +159,8 @@ def train_als(spark: SparkSession, triplets_path: str, output: str, min_user_ite
     interactions = clean_triplets(spark, triplets_path, min_user_items, min_song_users)
     user_indexer = StringIndexer(inputCol="user_id", outputCol="user_idx", handleInvalid="skip")
     song_indexer = StringIndexer(inputCol="song_id", outputCol="song_idx", handleInvalid="skip")
-    indexed = Pipeline(stages=[user_indexer, song_indexer]).fit(interactions).transform(interactions).select(
+    index_model = Pipeline(stages=[user_indexer, song_indexer]).fit(interactions)
+    indexed = index_model.transform(interactions).select(
         F.col("user_id"), F.col("song_id"), F.col("user_idx").cast("int"), F.col("song_idx").cast("int"), "play_count"
     )
     train, test = userwise_split(indexed)
@@ -151,6 +168,9 @@ def train_als(spark: SparkSession, triplets_path: str, output: str, min_user_ite
     model = ALS(userCol="user_idx", itemCol="song_idx", ratingCol="play_count", implicitPrefs=True, rank=64, regParam=0.08, alpha=20.0, maxIter=15, seed=SEED, coldStartStrategy="drop").fit(train)
     Path(output).mkdir(parents=True, exist_ok=True)
     model.write().overwrite().save(f"{output}/model")
+    index_model.write().overwrite().save(f"{output}/indexers")
+    indexed.select("user_id", "user_idx").distinct().write.mode("overwrite").parquet(f"{output}/user_mapping")
+    indexed.select("song_id", "song_idx").distinct().write.mode("overwrite").parquet(f"{output}/song_mapping")
     recommend_unseen(model, train).write.mode("overwrite").parquet(f"{output}/recommendations")
     test.write.mode("overwrite").parquet(f"{output}/test_interactions")
 
