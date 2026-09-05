@@ -52,8 +52,9 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
     labelled = audio.join(genre, "track_id", "inner").withColumn(
         "label", F.when(F.col("genre") == positive_genre, F.lit(1.0)).otherwise(F.lit(0.0))
     )
-    positives = labelled.filter("label = 1")
-    negatives = labelled.filter("label = 0")
+    train, test = labelled.randomSplit([0.8, 0.2], seed=SEED)
+    positives = train.filter("label = 1")
+    negatives = train.filter("label = 0")
     negative_fraction = min(1.0, positives.count() / max(negatives.count(), 1))
     balanced = positives.unionByName(negatives.sample(False, negative_fraction, SEED))
     # The target is numeric, so exclude it explicitly before assembling model
@@ -61,7 +62,7 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
     features = [column for column in nonzero_numeric_columns(balanced) if column != "label"]
     if model_name == "lr":
         assembler = VectorAssembler(inputCols=features, outputCol="features_raw", handleInvalid="skip")
-        stages = [assembler, StandardScaler(inputCol="features_raw", outputCol="features", withMean=False), LogisticRegression(maxIter=100, seed=SEED)]
+        stages = [assembler, StandardScaler(inputCol="features_raw", outputCol="features", withMean=False), LogisticRegression(maxIter=100)]
     elif model_name == "rf":
         assembler = VectorAssembler(inputCols=features, outputCol="features", handleInvalid="skip")
         stages = [assembler, RandomForestClassifier(numTrees=200, maxDepth=12, seed=SEED)]
@@ -70,8 +71,7 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
         stages = [assembler, GBTClassifier(maxIter=100, maxDepth=6, seed=SEED)]
     else:
         raise ValueError("model must be one of: lr, rf, gbt")
-    train, test = balanced.randomSplit([0.8, 0.2], seed=SEED)
-    fitted = Pipeline(stages=stages).fit(train)
+    fitted = Pipeline(stages=stages).fit(balanced)
     predictions = fitted.transform(test)
     auc = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC").evaluate(predictions)
     Path(output).mkdir(parents=True, exist_ok=True)
