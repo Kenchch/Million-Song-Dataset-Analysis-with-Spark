@@ -9,9 +9,12 @@ Distributed feature engineering, genre modelling, and implicit-feedback recommen
 
 | Data scale | Audio modelling | Recommendations |
 | --- | --- | --- |
-| **48,373,586** listening events, **1,019,318** users, **384,546** songs | **12.2 GB** of audio feature files; best recorded binary result: **0.8882 AUROC** | ALS trained on **33,197,154** interactions and evaluated on **8,622,941** held-out interactions |
+| **48,373,586** listening events, **1,019,318** users, **384,546** songs | **12.2 GB** of audio feature files; best recorded binary result: **0.8882 AUROC** | ALS trained on **33,197,154** interactions, holding out **8,622,941** |
 
-The original ALS experiment recorded **Precision@10 0.1333**, **NDCG@10 0.1428**, and **MAP@10 0.0035**. These are assignment-run results, not universal benchmarks; see [the results and limitations](docs/results.md).
+The recorded ALS ranking numbers do **not** describe that held-out set. They were
+produced by a notebook cell that scored three sampled users, and they are
+reported as such in [the results and limitations](docs/results.md), which also
+covers two defects found in that evaluation while preparing this repository.
 
 ## Workflows
 
@@ -92,11 +95,12 @@ spark-submit src/msd_pipeline.py train-als \
 - The attributes CSV drives explicit Spark schemas; feature files are not inferred.
 - Binary classifiers use a deterministic random seed and save their fitted Spark pipeline.
 - Genre data is split before balancing; only the training partition is downsampled and used to select features. The held-out partition retains its original class mix. Logistic regression uses its deterministic optimizer; the split and stochastic tree models use explicit seeds.
-- ALS splitting is performed within each user, so every test user also appears in training.
+- ALS splitting is performed within each user, so every test user also appears in training. The split orders each user's rows by a hash rather than `rand()`: the train and test frames are two filters over one plan, evaluated by separate actions, and a nondeterministic key generated twice can put a row in both halves or in neither.
+- Recommendations exclude each user's training interactions. ALS scores every item, so the raw top-k is mostly songs the split already moved into training, which can never match a held-out row and merely displace candidates that could.
 - The recommendation workflow removes sparse users and songs before factorisation. Tune the thresholds to your experiment rather than treating the report's values as universal.
 - Inputs, model checkpoints, and output directories are gitignored.
 - CI validates the ranking metrics, Notebook JSON, output stripping, and absence of known credential remnants without requiring the 48.4-million-row dataset.
-- A separate CI job runs real Spark training for all three genre models on synthetic data, checks the saved model's feature inputs, and verifies that evaluation preserves the held-out population.
+- A separate CI job runs real Spark training on synthetic data: all three genre models, and an ALS fit asserting no recommendation is an item the user was trained on. It also asserts the unfiltered call does return such items, so the reason for the exclusion stays visible.
 
 The standalone ranking helpers require a positive integer cutoff, credit each
 relevant item once at its original rank, and retain duplicate slots as missed
