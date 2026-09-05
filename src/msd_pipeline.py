@@ -90,11 +90,53 @@ def clean_triplets(spark: SparkSession, triplets_path: str, min_user_items: int,
 
 
 def userwise_split(interactions: DataFrame, train_fraction: float = 0.8) -> tuple[DataFrame, DataFrame]:
-    ranked = interactions.withColumn("_random", F.rand(SEED)).withColumn(
-        "_rank", F.row_number().over(Window.partitionBy("user_id").orderBy("_random"))
+    """Split each user's interactions, holding out the same rows on every run.
+
+    The ordering key is a hash of the row rather than `rand()`. `rand()` is a
+    nondeterministic expression, and the two frames returned here are separate
+    filters over one plan, each evaluated by its own action -- so the random
+    column is generated twice. If those evaluations disagree, and a different
+    pre-shuffle partitioning is enough to make them disagree, a row can land in
+    both halves or in neither. The first case leaks training rows into the
+    held-out set; the second drops them silently.
+    """
+    ordering = F.hash(F.concat_ws("\u0000", F.col("user_id"), F.col("song_id"), F.lit(SEED)))
+    ranked = interactions.withColumn("_order", ordering).withColumn(
+        "_rank", F.row_number().over(Window.partitionBy("user_id").orderBy("_order", "song_id"))
     ).withColumn("_count", F.count("*").over(Window.partitionBy("user_id")))
     cutoff = F.ceil(F.col("_count") * train_fraction)
-    return ranked.filter(F.col("_rank") <= cutoff).drop("_random", "_rank", "_count"), ranked.filter(F.col("_rank") > cutoff).drop("_random", "_rank", "_count")
+    columns = interactions.columns
+    return (
+        ranked.filter(F.col("_rank") <= cutoff).select(*columns),
+        ranked.filter(F.col("_rank") > cutoff).select(*columns),
+    )
+
+
+def recommend_unseen(model, train: DataFrame, k: int = 10, max_candidates: int = 500) -> DataFrame:
+    """Top-k recommendations per user, with that user's training items removed.
+
+    ALS scores every item, so `recommendForAllUsers` hands back the songs a user
+    has already played alongside the ones they have not. Those already-played
+    songs are exactly the rows the user-wise split kept in training, so they can
+    never appear in the held-out set -- every slot one occupies is a slot that
+    cannot be a hit, and precision, NDCG and MAP all fall as a result.
+
+    Asking for `k + longest_history` candidates guarantees k unseen items for
+    every user, bounded by `max_candidates` so one extreme history cannot make
+    the request unaffordable. Users whose history exceeds that bound may return
+    fewer than k rows rather than silently returning seen ones.
+    """
+    longest_history = train.groupBy("user_idx").count().agg(F.max("count")).first()[0] or 0
+    depth = min(k + int(longest_history), max_candidates)
+    exploded = model.recommendForAllUsers(depth).select(
+        "user_idx", F.explode("recommendations").alias("rec")
+    ).select("user_idx", F.col("rec.song_idx").alias("song_idx"), F.col("rec.rating").alias("score"))
+    seen = train.select("user_idx", "song_idx").distinct()
+    unseen = exploded.join(seen, ["user_idx", "song_idx"], "left_anti")
+    ranked = unseen.withColumn(
+        "rank", F.row_number().over(Window.partitionBy("user_idx").orderBy(F.desc("score"), F.asc("song_idx")))
+    )
+    return ranked.filter(F.col("rank") <= k)
 
 
 def train_als(spark: SparkSession, triplets_path: str, output: str, min_user_items: int, min_song_users: int) -> None:
@@ -105,10 +147,11 @@ def train_als(spark: SparkSession, triplets_path: str, output: str, min_user_ite
         F.col("user_id"), F.col("song_id"), F.col("user_idx").cast("int"), F.col("song_idx").cast("int"), "play_count"
     )
     train, test = userwise_split(indexed)
+    train.cache()
     model = ALS(userCol="user_idx", itemCol="song_idx", ratingCol="play_count", implicitPrefs=True, rank=64, regParam=0.08, alpha=20.0, maxIter=15, seed=SEED, coldStartStrategy="drop").fit(train)
     Path(output).mkdir(parents=True, exist_ok=True)
     model.write().overwrite().save(f"{output}/model")
-    model.recommendForAllUsers(10).write.mode("overwrite").parquet(f"{output}/recommendations")
+    recommend_unseen(model, train).write.mode("overwrite").parquet(f"{output}/recommendations")
     test.write.mode("overwrite").parquet(f"{output}/test_interactions")
 
 
