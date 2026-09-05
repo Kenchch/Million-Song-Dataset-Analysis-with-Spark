@@ -91,9 +91,17 @@ spark-submit src/msd_pipeline.py train-als \
 
 - The attributes CSV drives explicit Spark schemas; feature files are not inferred.
 - Binary classifiers use a deterministic random seed and save their fitted Spark pipeline.
+- Genre data is split before balancing; only the training partition is downsampled and used to select features. The held-out partition retains its original class mix. Logistic regression uses its deterministic optimizer; the split and stochastic tree models use explicit seeds.
 - ALS splitting is performed within each user, so every test user also appears in training.
 - The recommendation workflow removes sparse users and songs before factorisation. Tune the thresholds to your experiment rather than treating the report's values as universal.
 - Inputs, model checkpoints, and output directories are gitignored.
 - CI validates the ranking metrics, Notebook JSON, output stripping, and absence of known credential remnants without requiring the 48.4-million-row dataset.
+- A separate CI job runs real Spark training for all three genre models on synthetic data, checks the saved model's feature inputs, and verifies that evaluation preserves the held-out population.
+
+The standalone ranking helpers require a positive integer cutoff, credit each
+relevant item once at its original rank, and retain duplicate slots as missed
+opportunities. Precision divides by the requested cutoff even for shorter lists.
+The ALS command currently exports recommendations and held-out interactions;
+it does not execute these helpers or regenerate the historical notebook scores.
 
 The code provides the pipeline; it does not claim that results will exactly reproduce the report without the same source snapshot, cluster configuration, preprocessing, and random seed.
