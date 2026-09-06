@@ -84,6 +84,12 @@ spark-submit src/msd_pipeline.py train-genre \
 # Filter interactions, make a per-user 80/20 split, and train implicit ALS
 spark-submit src/msd_pipeline.py train-als \
   --triplets /data/tasteprofile/triplets.tsv --output output/als
+
+# Evaluate every held-out user, including users with no recommendations
+spark-submit src/msd_pipeline.py evaluate-als \
+  --recommendations output/als/recommendations \
+  --test-interactions output/als/test_interactions \
+  --k 10 --output output/als_evaluation
 ```
 
 ## Reproducibility choices
@@ -123,7 +129,18 @@ this export is not an atomic publication mechanism.
 The standalone ranking helpers require a positive integer cutoff, credit each
 relevant item once at its original rank, and retain duplicate slots as missed
 opportunities. Precision divides by the requested cutoff even for shorter lists.
-The ALS command currently exports recommendations and held-out interactions;
-it does not execute these helpers or regenerate the historical notebook scores.
+`evaluate-als` computes macro Precision@K, NDCG@K and MAP@K with Spark's
+RankingEvaluator, including held-out users with zero predictions. It saves a small
+`metrics/` CSV and per-user `users/` Parquet with labels, predictions and hit counts.
+Duplicate recommendation ranks or songs are rejected. The real-Spark fixture
+compares all three metrics with the standalone helpers, including missing users.
+This validates the implementation; historical notebook scores have not been regenerated.
+
+ALS defaults are rank 20, regularization 0.05, alpha 20 and 15 iterations;
+`--rank`, `--reg-param`, `--alpha` and `--max-iter` expose these choices.
+Genre `--balance-ratio` defaults to 1.0; only training negatives are sampled.
+Genre evaluation also reports PR-AUC, held-out row count and positive prevalence.
+Rows with missing numeric features are removed before splitting and counted.
+Install `requirements-notebooks.txt` separately for historical notebook dependencies.
 
 The code provides the pipeline; it does not claim that results will exactly reproduce the report without the same source snapshot, cluster configuration, preprocessing, and random seed.
