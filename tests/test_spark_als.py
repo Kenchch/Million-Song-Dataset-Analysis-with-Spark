@@ -96,16 +96,25 @@ class TestUserwiseSplit:
         test_users = {r.user_idx for r in test.select("user_idx").distinct().collect()}
         assert test_users <= train_users
 
-    def test_split_is_stable_across_separate_evaluations(self, indexed):
-        """The train and test frames are separate filters over one plan, each
-        evaluated by its own action. With a nondeterministic ordering key the
-        two evaluations can disagree and rows leak across the boundary."""
-        first_train, first_test = userwise_split(indexed)
-        first = (_pairs(first_train), _pairs(first_test))
+    def test_split_does_not_depend_on_input_partitioning(self, indexed):
+        """The ordering key has to be a function of the row, not of where the
+        row happens to sit.
 
-        second_train, second_test = userwise_split(indexed)
+        `rand(seed)` seeds a generator per partition, so the same rows laid out
+        over a different number of partitions draw different numbers, order
+        differently within each user, and land on different sides of the
+        boundary. A row hash cannot do that.
 
-        assert (_pairs(second_train), _pairs(second_test)) == first
+        Calling the split twice on one frame does not test this: a cached
+        parent hands back a single fixed partitioning, so `rand(seed)` is
+        stable across those two calls and the assertion passes whichever
+        implementation is underneath. Repartitioning is what separates them.
+        """
+        one_partition = userwise_split(indexed.repartition(1))
+        many_partitions = userwise_split(indexed.repartition(7, "user_id"))
+
+        assert _pairs(one_partition[0]) == _pairs(many_partitions[0])
+        assert _pairs(one_partition[1]) == _pairs(many_partitions[1])
 
 
 class TestRecommendUnseen:
