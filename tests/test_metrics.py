@@ -1,6 +1,8 @@
-from src.metrics import average_precision_at_k, ndcg_at_k, precision_at_k
-import pytest
 from itertools import repeat
+
+import pytest
+
+from src.metrics import average_precision_at_k, ndcg_at_k, precision_at_k
 
 
 def test_precision_at_k():
@@ -29,4 +31,3 @@ def test_duplicates_cannot_inflate_scores(metric):
     assert metric([], {1}, 3) == 0
     assert metric([1], set(), 3) == 0
     assert metric(repeat(1), {1}, 3) == metric([1, 1, 1], {1}, 3)
-

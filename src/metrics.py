@@ -22,7 +22,9 @@ def precision_at_k(recommendations: Iterable[int], relevant: set[int], k: int = 
     return sum(1 for _ in _ranked_hits(recommendations, relevant, k)) / k
 
 
-def average_precision_at_k(recommendations: Iterable[int], relevant: set[int], k: int = 10) -> float:
+def average_precision_at_k(
+    recommendations: Iterable[int], relevant: set[int], k: int = 10
+) -> float:
     hits, score = 0, 0.0
     for rank in _ranked_hits(recommendations, relevant, k):
         hits += 1
@@ -34,4 +36,3 @@ def ndcg_at_k(recommendations: Iterable[int], relevant: set[int], k: int = 10) -
     actual = sum(1 / math.log2(rank + 1) for rank in _ranked_hits(recommendations, relevant, k))
     ideal = sum(1 / math.log2(rank + 1) for rank in range(1, min(len(relevant), k) + 1))
     return actual / ideal if ideal else 0.0
-

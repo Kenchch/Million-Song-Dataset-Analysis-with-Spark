@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-
 NOTEBOOKS = sorted((Path(__file__).parents[1] / "notebooks").glob("*.ipynb"))
 # The classes of secret the original cluster notebooks carried: Azure SAS query
 # parameters, storage account keys, and academic account addresses.
@@ -14,11 +13,11 @@ NOTEBOOKS = sorted((Path(__file__).parents[1] / "notebooks").glob("*.ipynb"))
 # keep the identifier out of the repository was the one place still publishing
 # it -- on every clone, in the file whose job was to prevent exactly that.
 SENSITIVE_REMNANTS = re.compile(
-    r"sp=racwdl"                                          # SAS permission string
-    r"|[?&]sig="                                          # SAS signature
-    r"|[?&]se=\d{4}-\d{2}-\d{2}"                          # SAS expiry
-    r"|AccountKey="                                       # storage account key
-    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.ac\.[a-z]{2}",   # academic address
+    r"sp=racwdl"  # SAS permission string
+    r"|[?&]sig="  # SAS signature
+    r"|[?&]se=\d{4}-\d{2}-\d{2}"  # SAS expiry
+    r"|AccountKey="  # storage account key
+    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.ac\.[a-z]{2}",  # academic address
     re.IGNORECASE,
 )
 

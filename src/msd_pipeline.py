@@ -7,11 +7,12 @@ from pathlib import Path
 
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import GBTClassifier, LogisticRegression, RandomForestClassifier
-from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, RankingEvaluator
 from pyspark.ml.feature import StandardScaler, StringIndexer, VectorAssembler
 from pyspark.ml.recommendation import ALS
-from pyspark.sql import DataFrame, SparkSession, Window, functions as F, types as T
-
+from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
 SEED = 420
 
@@ -22,9 +23,16 @@ def get_spark() -> SparkSession:
 
 def schema_from_attributes(spark: SparkSession, attributes_path: str) -> T.StructType:
     """Construct a feature-file schema from the accompanying attributes CSV."""
-    mapping = {"string": T.StringType(), "real": T.DoubleType(), "numeric": T.DoubleType(), "float": T.DoubleType()}
-    attributes = spark.read.option("header", "false").csv(attributes_path).select(
-        F.col("_c0").alias("name"), F.lower(F.trim(F.col("_c1"))).alias("source_type")
+    mapping = {
+        "string": T.StringType(),
+        "real": T.DoubleType(),
+        "numeric": T.DoubleType(),
+        "float": T.DoubleType(),
+    }
+    attributes = (
+        spark.read.option("header", "false")
+        .csv(attributes_path)
+        .select(F.col("_c0").alias("name"), F.lower(F.trim(F.col("_c1"))).alias("source_type"))
     )
     fields = []
     for row in attributes.collect():
@@ -35,34 +43,71 @@ def schema_from_attributes(spark: SparkSession, attributes_path: str) -> T.Struc
 
 
 def load_audio(spark: SparkSession, attributes_path: str, features_path: str) -> DataFrame:
-    return spark.read.schema(schema_from_attributes(spark, attributes_path)).option("header", "false").csv(features_path)
+    return (
+        spark.read.schema(schema_from_attributes(spark, attributes_path))
+        .option("header", "false")
+        .csv(features_path)
+    )
 
 
 def nonzero_numeric_columns(frame: DataFrame) -> list[str]:
-    numeric = [field.name for field in frame.schema.fields if isinstance(field.dataType, T.NumericType)]
-    maxima = frame.agg(*[F.max(F.abs(F.col(column))).alias(column) for column in numeric]).first().asDict()
+    numeric = [
+        field.name for field in frame.schema.fields if isinstance(field.dataType, T.NumericType)
+    ]
+    maxima = (
+        frame.agg(*[F.max(F.abs(F.col(column))).alias(column) for column in numeric])
+        .first()
+        .asDict()
+    )
     return [column for column in numeric if maxima[column] not in (None, 0)]
 
 
-def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, positive_genre: str, model_name: str, output: str) -> None:
+def train_genre_model(
+    spark: SparkSession,
+    audio_path: str,
+    genre_path: str,
+    positive_genre: str,
+    model_name: str,
+    output: str,
+    balance_ratio: float = 1.0,
+) -> None:
+    if not 0 < balance_ratio < float("inf"):
+        raise ValueError("balance_ratio must be finite and positive")
     audio = spark.read.parquet(audio_path)
-    genre = spark.read.option("sep", "\t").option("header", "false").csv(genre_path).select(
-        F.col("_c0").alias("track_id"), F.col("_c1").alias("genre")
+    genre = (
+        spark.read.option("sep", "\t")
+        .option("header", "false")
+        .csv(genre_path)
+        .select(F.col("_c0").alias("track_id"), F.col("_c1").alias("genre"))
     )
     labelled = audio.join(genre, "track_id", "inner").withColumn(
         "label", F.when(F.col("genre") == positive_genre, F.lit(1.0)).otherwise(F.lit(0.0))
     )
+    numeric_columns = [
+        field.name
+        for field in labelled.schema.fields
+        if isinstance(field.dataType, T.NumericType) and field.name != "label"
+    ]
+    input_rows = labelled.count()
+    labelled = labelled.dropna(subset=numeric_columns)
+    dropped_rows = input_rows - labelled.count()
     train, test = labelled.randomSplit([0.8, 0.2], seed=SEED)
     positives = train.filter("label = 1")
     negatives = train.filter("label = 0")
-    negative_fraction = min(1.0, positives.count() / max(negatives.count(), 1))
+    negative_fraction = min(1.0, balance_ratio * positives.count() / max(negatives.count(), 1))
     balanced = positives.unionByName(negatives.sample(False, negative_fraction, SEED))
     # The target is numeric, so exclude it explicitly before assembling model
     # inputs. Including it would leak the answer into every classifier.
     features = [column for column in nonzero_numeric_columns(balanced) if column != "label"]
     if model_name == "lr":
-        assembler = VectorAssembler(inputCols=features, outputCol="features_raw", handleInvalid="skip")
-        stages = [assembler, StandardScaler(inputCol="features_raw", outputCol="features", withMean=False), LogisticRegression(maxIter=100)]
+        assembler = VectorAssembler(
+            inputCols=features, outputCol="features_raw", handleInvalid="skip"
+        )
+        stages = [
+            assembler,
+            StandardScaler(inputCol="features_raw", outputCol="features", withMean=False),
+            LogisticRegression(maxIter=100),
+        ]
     elif model_name == "rf":
         assembler = VectorAssembler(inputCols=features, outputCol="features", handleInvalid="skip")
         stages = [assembler, RandomForestClassifier(numTrees=200, maxDepth=12, seed=SEED)]
@@ -73,35 +118,90 @@ def train_genre_model(spark: SparkSession, audio_path: str, genre_path: str, pos
         raise ValueError("model must be one of: lr, rf, gbt")
     fitted = Pipeline(stages=stages).fit(balanced)
     predictions = fitted.transform(test)
-    auc = BinaryClassificationEvaluator(labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC").evaluate(predictions)
-    Path(output).mkdir(parents=True, exist_ok=True)
+    auc = BinaryClassificationEvaluator(
+        labelCol="label", rawPredictionCol="rawPrediction", metricName="areaUnderROC"
+    ).evaluate(predictions)
+    pr_auc = BinaryClassificationEvaluator(metricName="areaUnderPR").evaluate(predictions)
+    test_stats = predictions.agg(
+        F.count("*").alias("test_rows"), F.avg("label").alias("positive_prevalence")
+    ).first()
     fitted.write().overwrite().save(f"{output}/model")
-    spark.createDataFrame([(model_name, positive_genre, len(features), auc)], ["model", "positive_genre", "feature_count", "roc_auc"]).write.mode("overwrite").option("header", True).csv(f"{output}/metrics")
-    predictions.select("track_id", "genre", "label", "prediction", "probability").write.mode("overwrite").parquet(f"{output}/predictions")
+    spark.createDataFrame(
+        [
+            (
+                model_name,
+                positive_genre,
+                len(features),
+                auc,
+                pr_auc,
+                test_stats.test_rows,
+                test_stats.positive_prevalence,
+                dropped_rows,
+            )
+        ],
+        [
+            "model",
+            "positive_genre",
+            "feature_count",
+            "roc_auc",
+            "pr_auc",
+            "test_rows",
+            "positive_prevalence",
+            "dropped_numeric_rows",
+        ],
+    ).write.mode("overwrite").option("header", True).csv(f"{output}/metrics")
+    predictions.select("track_id", "genre", "label", "prediction", "probability").write.mode(
+        "overwrite"
+    ).parquet(f"{output}/predictions")
 
 
-def clean_triplets(spark: SparkSession, triplets_path: str, min_user_items: int, min_song_users: int) -> DataFrame:
+def clean_triplets(
+    spark: SparkSession, triplets_path: str, min_user_items: int, min_song_users: int
+) -> DataFrame:
     if min_user_items < 1 or min_song_users < 1:
         raise ValueError("activity thresholds must be positive")
-    interactions = spark.read.option("sep", "\t").option("header", "false").csv(triplets_path).select(
-        F.col("_c0").alias("user_id"), F.col("_c1").alias("song_id"), F.col("_c2").cast("double").alias("play_count")
+    interactions = (
+        spark.read.option("sep", "\t")
+        .option("header", "false")
+        .csv(triplets_path)
+        .select(
+            F.col("_c0").alias("user_id"),
+            F.col("_c1").alias("song_id"),
+            F.col("_c2").cast("double").alias("play_count"),
+        )
     )
     invalid = interactions.filter(
-        F.col("user_id").isNull() | (F.trim("user_id") == "")
-        | F.col("song_id").isNull() | (F.trim("song_id") == "")
-        | F.col("play_count").isNull() | F.isnan("play_count")
-        | (F.col("play_count") <= 0) | (F.col("play_count") == float("inf"))
+        F.col("user_id").isNull()
+        | (F.trim("user_id") == "")
+        | F.col("song_id").isNull()
+        | (F.trim("song_id") == "")
+        | F.col("play_count").isNull()
+        | F.isnan("play_count")
+        | (F.col("play_count") <= 0)
+        | (F.col("play_count") == float("inf"))
     )
     if invalid.limit(1).count():
         raise ValueError("triplets require nonempty IDs and finite positive play counts")
     if interactions.groupBy("user_id", "song_id").count().filter("count > 1").limit(1).count():
         raise ValueError("duplicate user/song pairs: resolve overlapping input before splitting")
-    active_users = interactions.groupBy("user_id").agg(F.countDistinct("song_id").alias("item_count")).filter(F.col("item_count") >= min_user_items)
-    active_songs = interactions.groupBy("song_id").agg(F.countDistinct("user_id").alias("user_count")).filter(F.col("user_count") >= min_song_users)
-    return interactions.join(active_users.select("user_id"), "user_id").join(active_songs.select("song_id"), "song_id")
+    active_users = (
+        interactions.groupBy("user_id")
+        .agg(F.countDistinct("song_id").alias("item_count"))
+        .filter(F.col("item_count") >= min_user_items)
+    )
+    active_songs = (
+        interactions.groupBy("song_id")
+        .agg(F.countDistinct("user_id").alias("user_count"))
+        .filter(F.col("user_count") >= min_song_users)
+    )
+    return interactions.join(active_users.select("user_id"), "user_id").join(
+        active_songs.select("song_id"), "song_id"
+    )
 
 
-def userwise_split(interactions: DataFrame, train_fraction: float = 0.8) -> tuple[DataFrame, DataFrame]:
+def userwise_split(
+    interactions: DataFrame, train_fraction: float = 0.8
+) -> tuple[DataFrame, DataFrame]:
     """Split each user's interactions, holding out the same rows on every run.
 
     The ordering key is a hash of the row rather than `rand()`. `rand()` is a
@@ -115,12 +215,16 @@ def userwise_split(interactions: DataFrame, train_fraction: float = 0.8) -> tupl
     if not 0 < train_fraction < 1:
         raise ValueError("train_fraction must be between zero and one")
     ordering = F.hash(F.concat_ws("\u0000", F.col("user_id"), F.col("song_id"), F.lit(SEED)))
-    ranked = interactions.withColumn("_order", ordering).withColumn(
-        "_rank", F.row_number().over(Window.partitionBy("user_id").orderBy("_order", "song_id"))
-    ).withColumn("_count", F.count("*").over(Window.partitionBy("user_id")))
-    cutoff = F.greatest(F.lit(1), F.least(
-        F.ceil(F.col("_count") * train_fraction), F.col("_count") - 1
-    ))
+    ranked = (
+        interactions.withColumn("_order", ordering)
+        .withColumn(
+            "_rank", F.row_number().over(Window.partitionBy("user_id").orderBy("_order", "song_id"))
+        )
+        .withColumn("_count", F.count("*").over(Window.partitionBy("user_id")))
+    )
+    cutoff = F.greatest(
+        F.lit(1), F.least(F.ceil(F.col("_count") * train_fraction), F.col("_count") - 1)
+    )
     columns = interactions.columns
     return (
         ranked.filter(F.col("_rank") <= cutoff).select(*columns),
@@ -144,35 +248,131 @@ def recommend_unseen(model, train: DataFrame, k: int = 10, max_candidates: int =
     """
     longest_history = train.groupBy("user_idx").count().agg(F.max("count")).first()[0] or 0
     depth = min(k + int(longest_history), max_candidates)
-    exploded = model.recommendForAllUsers(depth).select(
-        "user_idx", F.explode("recommendations").alias("rec")
-    ).select("user_idx", F.col("rec.song_idx").alias("song_idx"), F.col("rec.rating").alias("score"))
+    exploded = (
+        model.recommendForAllUsers(depth)
+        .select("user_idx", F.explode("recommendations").alias("rec"))
+        .select(
+            "user_idx", F.col("rec.song_idx").alias("song_idx"), F.col("rec.rating").alias("score")
+        )
+    )
     seen = train.select("user_idx", "song_idx").distinct()
     unseen = exploded.join(seen, ["user_idx", "song_idx"], "left_anti")
     ranked = unseen.withColumn(
-        "rank", F.row_number().over(Window.partitionBy("user_idx").orderBy(F.desc("score"), F.asc("song_idx")))
+        "rank",
+        F.row_number().over(
+            Window.partitionBy("user_idx").orderBy(F.desc("score"), F.asc("song_idx"))
+        ),
     )
     return ranked.filter(F.col("rank") <= k)
 
 
-def train_als(spark: SparkSession, triplets_path: str, output: str, min_user_items: int, min_song_users: int) -> None:
+def train_als(
+    spark: SparkSession,
+    triplets_path: str,
+    output: str,
+    min_user_items: int,
+    min_song_users: int,
+    *,
+    rank: int = 20,
+    reg_param: float = 0.05,
+    alpha: float = 20.0,
+    max_iter: int = 15,
+) -> None:
     interactions = clean_triplets(spark, triplets_path, min_user_items, min_song_users)
     user_indexer = StringIndexer(inputCol="user_id", outputCol="user_idx", handleInvalid="skip")
     song_indexer = StringIndexer(inputCol="song_id", outputCol="song_idx", handleInvalid="skip")
     index_model = Pipeline(stages=[user_indexer, song_indexer]).fit(interactions)
     indexed = index_model.transform(interactions).select(
-        F.col("user_id"), F.col("song_id"), F.col("user_idx").cast("int"), F.col("song_idx").cast("int"), "play_count"
+        F.col("user_id"),
+        F.col("song_id"),
+        F.col("user_idx").cast("int"),
+        F.col("song_idx").cast("int"),
+        "play_count",
     )
     train, test = userwise_split(indexed)
     train.cache()
-    model = ALS(userCol="user_idx", itemCol="song_idx", ratingCol="play_count", implicitPrefs=True, rank=64, regParam=0.08, alpha=20.0, maxIter=15, seed=SEED, coldStartStrategy="drop").fit(train)
+    model = ALS(
+        userCol="user_idx",
+        itemCol="song_idx",
+        ratingCol="play_count",
+        implicitPrefs=True,
+        rank=rank,
+        regParam=reg_param,
+        alpha=alpha,
+        maxIter=max_iter,
+        seed=SEED,
+        coldStartStrategy="drop",
+    ).fit(train)
     Path(output).mkdir(parents=True, exist_ok=True)
     model.write().overwrite().save(f"{output}/model")
     index_model.write().overwrite().save(f"{output}/indexers")
-    indexed.select("user_id", "user_idx").distinct().write.mode("overwrite").parquet(f"{output}/user_mapping")
-    indexed.select("song_id", "song_idx").distinct().write.mode("overwrite").parquet(f"{output}/song_mapping")
+    indexed.select("user_id", "user_idx").distinct().write.mode("overwrite").parquet(
+        f"{output}/user_mapping"
+    )
+    indexed.select("song_id", "song_idx").distinct().write.mode("overwrite").parquet(
+        f"{output}/song_mapping"
+    )
     recommend_unseen(model, train).write.mode("overwrite").parquet(f"{output}/recommendations")
     test.write.mode("overwrite").parquet(f"{output}/test_interactions")
+
+
+def evaluate_als(
+    spark: SparkSession, recommendations: str, test_interactions: str, output: str, k: int = 10
+) -> dict:
+    """Macro ranking metrics over every held-out user, including zero-prediction users."""
+    if k < 1:
+        raise ValueError("k must be positive")
+    recs = spark.read.parquet(recommendations).filter(F.col("rank").between(1, k))
+    for keys in (["user_idx", "rank"], ["user_idx", "song_idx"]):
+        if recs.groupBy(*keys).count().filter("count > 1").limit(1).count():
+            raise ValueError("recommendations must contain unique ranks and songs per user")
+    labels = (
+        spark.read.parquet(test_interactions)
+        .groupBy("user_idx")
+        .agg(F.collect_set(F.col("song_idx").cast("double")).alias("label"))
+    )
+    ranked = (
+        recs.groupBy("user_idx")
+        .agg(
+            F.sort_array(
+                F.collect_list(F.struct("rank", F.col("song_idx").cast("double").alias("song")))
+            ).alias("ranked")
+        )
+        .withColumn("prediction", F.transform("ranked", lambda item: item["song"]))
+    )
+    pairs = (
+        labels.join(ranked.select("user_idx", "prediction"), "user_idx", "left")
+        .withColumn("prediction", F.coalesce("prediction", F.array().cast("array<double>")))
+        .withColumn("hits", F.size(F.array_intersect("prediction", "label")))
+        .cache()
+    )
+    try:
+        population = pairs.agg(
+            F.count("*").alias("users"),
+            F.sum("hits").alias("hits"),
+            F.sum((F.size("prediction") < k).cast("int")).alias("users_below_k"),
+        ).first()
+        if population.users == 0:
+            raise ValueError("The held-out population is empty")
+        metrics = {
+            "k": k,
+            "users": population.users,
+            "hits": population.hits,
+            "users_below_k": population.users_below_k,
+        }
+        for name, metric in [
+            ("precision_at_k", "precisionAtK"),
+            ("ndcg_at_k", "ndcgAtK"),
+            ("map_at_k", "meanAveragePrecisionAtK"),
+        ]:
+            metrics[name] = RankingEvaluator(metricName=metric, k=k).evaluate(pairs)
+        spark.createDataFrame([metrics]).coalesce(1).write.mode("overwrite").option(
+            "header", True
+        ).csv(f"{output}/metrics")
+        pairs.write.mode("overwrite").parquet(f"{output}/users")
+        return metrics
+    finally:
+        pairs.unpersist()
 
 
 def main() -> None:
@@ -187,11 +387,21 @@ def main() -> None:
     genre.add_argument("--positive-genre", required=True)
     genre.add_argument("--model", choices=("lr", "rf", "gbt"), default="gbt")
     genre.add_argument("--output", required=True)
+    genre.add_argument("--balance-ratio", type=float, default=1.0)
     als = commands.add_parser("train-als")
     als.add_argument("--triplets", required=True)
     als.add_argument("--output", required=True)
     als.add_argument("--min-user-items", type=int, default=20)
     als.add_argument("--min-song-users", type=int, default=20)
+    als.add_argument("--rank", type=int, default=20)
+    als.add_argument("--reg-param", type=float, default=0.05)
+    als.add_argument("--alpha", type=float, default=20.0)
+    als.add_argument("--max-iter", type=int, default=15)
+    evaluate = commands.add_parser("evaluate-als")
+    evaluate.add_argument("--recommendations", required=True)
+    evaluate.add_argument("--test-interactions", required=True)
+    evaluate.add_argument("--output", required=True)
+    evaluate.add_argument("--k", type=int, default=10)
     args = parser.parse_args()
     spark = get_spark()
     try:
@@ -200,9 +410,29 @@ def main() -> None:
             frame.printSchema()
             frame.show(5, truncate=False)
         elif args.command == "train-genre":
-            train_genre_model(spark, args.audio, args.genres, args.positive_genre, args.model, args.output)
+            train_genre_model(
+                spark,
+                args.audio,
+                args.genres,
+                args.positive_genre,
+                args.model,
+                args.output,
+                args.balance_ratio,
+            )
+        elif args.command == "evaluate-als":
+            evaluate_als(spark, args.recommendations, args.test_interactions, args.output, args.k)
         else:
-            train_als(spark, args.triplets, args.output, args.min_user_items, args.min_song_users)
+            train_als(
+                spark,
+                args.triplets,
+                args.output,
+                args.min_user_items,
+                args.min_song_users,
+                rank=args.rank,
+                reg_param=args.reg_param,
+                alpha=args.alpha,
+                max_iter=args.max_iter,
+            )
     finally:
         spark.stop()
 
