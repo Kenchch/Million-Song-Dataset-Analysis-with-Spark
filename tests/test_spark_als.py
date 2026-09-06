@@ -1,46 +1,104 @@
 """Real-Spark checks on the ALS split and on what the model is allowed to recommend."""
+
 import pytest
 
 pytest.importorskip("pyspark")
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from src.msd_pipeline import SEED, clean_triplets, recommend_unseen, train_als, userwise_split
+from src.msd_pipeline import (
+    SEED,
+    clean_triplets,
+    evaluate_als,
+    recommend_unseen,
+    train_als,
+    userwise_split,
+)
 
 
 @pytest.fixture(scope="module")
 def spark():
-    session = (SparkSession.builder.master("local[2]")
-               .appName("als-regression-test")
-               .config("spark.ui.enabled", "false")
-               .config("spark.sql.shuffle.partitions", "2").getOrCreate())
+    session = (
+        SparkSession.builder.master("local[2]")
+        .appName("als-regression-test")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .getOrCreate()
+    )
     yield session
     session.stop()
 
 
 @pytest.fixture(scope="module")
 def indexed(spark):
-    rows = [(f"u{user}", f"s{(user * 7 + item) % 40}", float(1 + item % 3))
-            for user in range(30) for item in range(12)]
+    rows = [
+        (f"u{user}", f"s{(user * 7 + item) % 40}", float(1 + item % 3))
+        for user in range(30)
+        for item in range(12)
+    ]
     frame = spark.createDataFrame(rows, ["user_id", "song_id", "play_count"]).distinct()
-    indexers = [StringIndexer(inputCol="user_id", outputCol="user_idx"),
-                StringIndexer(inputCol="song_id", outputCol="song_idx")]
-    return Pipeline(stages=indexers).fit(frame).transform(frame).select(
-        "user_id", "song_id", F.col("user_idx").cast("int"), F.col("song_idx").cast("int"), "play_count"
-    ).cache()
+    indexers = [
+        StringIndexer(inputCol="user_id", outputCol="user_idx"),
+        StringIndexer(inputCol="song_id", outputCol="song_idx"),
+    ]
+    return (
+        Pipeline(stages=indexers)
+        .fit(frame)
+        .transform(frame)
+        .select(
+            "user_id",
+            "song_id",
+            F.col("user_idx").cast("int"),
+            F.col("song_idx").cast("int"),
+            "play_count",
+        )
+        .cache()
+    )
 
 
 def _pairs(frame):
     return {(row.user_idx, row.song_idx) for row in frame.select("user_idx", "song_idx").collect()}
 
 
-@pytest.mark.parametrize("payload", [
-    "u1\ts1\t1\nu1\ts1\t2\n", "u1\ts1\tNaN\n",
-    "u1\ts1\tInfinity\n", "u1\ts1\t-1\n", "u1\ts1\t0\n",
-    "u1\ts1\tbad\n", "\ts1\t1\n",
-])
+def test_ranking_evaluation_includes_users_without_recommendations(spark, tmp_path):
+    from src.metrics import average_precision_at_k, ndcg_at_k, precision_at_k
+
+    recs, heldout, output = [str(tmp_path / name) for name in ("recs", "test", "evaluation")]
+    spark.createDataFrame(
+        [(1, 10, 1), (1, 20, 2), (3, 99, 1)], ["user_idx", "song_idx", "rank"]
+    ).write.parquet(recs)
+    spark.createDataFrame(
+        [(1, 10), (1, 30), (2, 40), (3, 99)], ["user_idx", "song_idx"]
+    ).write.parquet(heldout)
+    metrics = evaluate_als(spark, recs, heldout, output, k=2)
+    population = [([10, 20], {10, 30}), ([], {40}), ([99], {99})]
+    assert metrics["users"] == 3
+    assert metrics["hits"] == 2
+    assert metrics["users_below_k"] == 2
+    for name, function in [
+        ("precision_at_k", precision_at_k),
+        ("ndcg_at_k", ndcg_at_k),
+        ("map_at_k", average_precision_at_k),
+    ]:
+        assert metrics[name] == pytest.approx(sum(function(r, t, 2) for r, t in population) / 3)
+    assert spark.read.parquet(f"{output}/users").count() == 3
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "u1\ts1\t1\nu1\ts1\t2\n",
+        "u1\ts1\tNaN\n",
+        "u1\ts1\tInfinity\n",
+        "u1\ts1\t-1\n",
+        "u1\ts1\t0\n",
+        "u1\ts1\tbad\n",
+        "\ts1\t1\n",
+    ],
+)
 def test_invalid_triplets_are_rejected(spark, tmp_path, payload):
     path = tmp_path / "invalid.tsv"
     path.write_text(payload)
@@ -49,8 +107,9 @@ def test_invalid_triplets_are_rejected(spark, tmp_path, payload):
 
 
 def test_small_histories_keep_a_holdout(spark):
-    frame = spark.createDataFrame([("u1", "s1"), ("u1", "s2"), ("u2", "s3")],
-                                  ["user_id", "song_id"])
+    frame = spark.createDataFrame(
+        [("u1", "s1"), ("u1", "s2"), ("u2", "s3")], ["user_id", "song_id"]
+    )
     train, test = userwise_split(frame)
     assert train.count() == 2
     assert [(r.user_id) for r in test.collect()] == ["u1"]
@@ -61,11 +120,13 @@ def test_small_histories_keep_a_holdout(spark):
 
 def test_exported_recommendations_resolve_to_source_ids(spark, tmp_path):
     path = tmp_path / "triplets.tsv"
-    path.write_text("".join(f"u{u}\ts{(u+i)%12}\t{i+1}\n"
-                            for u in range(8) for i in range(6)))
+    path.write_text(
+        "".join(f"u{u}\ts{(u + i) % 12}\t{i + 1}\n" for u in range(8) for i in range(6))
+    )
     output = str(tmp_path / "output")
     train_als(spark, str(path), output, 1, 1)
     from pyspark.ml import PipelineModel
+
     restored = PipelineModel.load(f"{output}/indexers")
     users = spark.read.parquet(f"{output}/user_mapping")
     songs = spark.read.parquet(f"{output}/song_mapping")
@@ -75,8 +136,12 @@ def test_exported_recommendations_resolve_to_source_ids(spark, tmp_path):
     decoded = recommendations.join(users, "user_idx").join(songs, "song_idx")
     assert decoded.count() == recommendations.count() > 0
     reindexed = restored.transform(decoded.select("user_id", "song_id"))
-    assert reindexed.select("user_idx", "song_idx").exceptAll(
-        recommendations.select("user_idx", "song_idx")).count() == 0
+    assert (
+        reindexed.select("user_idx", "song_idx")
+        .exceptAll(recommendations.select("user_idx", "song_idx"))
+        .count()
+        == 0
+    )
 
 
 class TestUserwiseSplit:
@@ -122,9 +187,18 @@ class TestRecommendUnseen:
     def trained(self, indexed):
         train, _ = userwise_split(indexed)
         train = train.cache()
-        model = ALS(userCol="user_idx", itemCol="song_idx", ratingCol="play_count",
-                    implicitPrefs=True, rank=8, regParam=0.08, alpha=20.0, maxIter=5,
-                    seed=SEED, coldStartStrategy="drop").fit(train)
+        model = ALS(
+            userCol="user_idx",
+            itemCol="song_idx",
+            ratingCol="play_count",
+            implicitPrefs=True,
+            rank=8,
+            regParam=0.08,
+            alpha=20.0,
+            maxIter=5,
+            seed=SEED,
+            coldStartStrategy="drop",
+        ).fit(train)
         return model, train
 
     def test_no_recommendation_is_an_item_the_user_already_played(self, trained):
@@ -141,9 +215,11 @@ class TestRecommendUnseen:
         into training -- items that can never match a held-out row."""
         model, train = trained
 
-        raw = model.recommendForAllUsers(5).select(
-            "user_idx", F.explode("recommendations").alias("rec")
-        ).select("user_idx", F.col("rec.song_idx").alias("song_idx"))
+        raw = (
+            model.recommendForAllUsers(5)
+            .select("user_idx", F.explode("recommendations").alias("rec"))
+            .select("user_idx", F.col("rec.song_idx").alias("song_idx"))
+        )
 
         assert raw.join(train, ["user_idx", "song_idx"], "inner").count() > 0
 
@@ -155,4 +231,10 @@ class TestRecommendUnseen:
         per_user = recommendations.groupBy("user_idx").count().collect()
         assert per_user, "expected recommendations for at least one user"
         assert all(row["count"] <= 5 for row in per_user)
-        assert {r.rank for r in recommendations.select("rank").distinct().collect()} <= {1, 2, 3, 4, 5}
+        assert {r.rank for r in recommendations.select("rank").distinct().collect()} <= {
+            1,
+            2,
+            3,
+            4,
+            5,
+        }
