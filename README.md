@@ -7,14 +7,10 @@ Distributed feature engineering, genre modelling, and implicit-feedback recommen
 
 ## At a glance
 
-| Data scale | Audio modelling | Recommendations |
-| --- | --- | --- |
-| **48,373,586** listening events, **1,019,318** users, **384,546** songs | **12.2 GB** of audio feature files; best recorded binary result: **0.8882 AUROC** | ALS trained on **33,197,154** interactions, holding out **8,622,941** |
-
-The recorded ALS ranking numbers do **not** describe that held-out set. They were
-produced by a notebook cell that scored three sampled users, and they are
-reported as such in [the results and limitations](docs/results.md), which also
-covers two defects found in that evaluation while preparing this repository.
+The source study used Taste Profile listening triplets and Million Song audio features.
+The reusable workflows implement genre classification and implicit-feedback ALS.
+The recorded binary GBT result was 0.8882 AUROC; see [provenance and limitations](docs/results.md).
+That AUROC is not comparable to a majority-class accuracy baseline, and does not certify the current CLI.
 
 ## Workflows
 
