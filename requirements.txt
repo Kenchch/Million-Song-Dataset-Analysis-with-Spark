@@ -1,5 +1,5 @@
 pyspark==3.5.9
 # Spark ML imports NumPy even when no notebook is used.
-numpy>=1.26,<3
+numpy>=2.5.2,<3
 pytest==9.1.1
 

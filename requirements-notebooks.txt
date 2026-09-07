@@ -1,4 +1,4 @@
 -r requirements.txt
-numpy>=1.26,<3
+numpy>=2.5.2,<3
 findspark>=2,<3
 ipython>=8,<10
