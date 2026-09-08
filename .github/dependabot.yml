@@ -15,3 +15,22 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+
+    # Spark 4 is a different runtime, not a newer library, and this repository
+    # has the failing test to prove it. Dependabot's own 4.2.0 pull request
+    # went red on tests/test_spark_als.py::test_invalid_triplets_are_rejected:
+    # Spark 4 turns ANSI mode on by default, so casting the malformed value
+    # 'bad' to DOUBLE raises CAST_INVALID_INPUT instead of producing NULL, and
+    # clean_triplets counts invalid rows by looking for the NULLs that no
+    # longer appear. 1 failed, 18 passed -- a behaviour change in the middle of
+    # the cleaning logic, not a packaging problem.
+    #
+    # Fixing it means deciding what the cleaner should do under ANSI, then
+    # re-running the analysis, which is deliberate work rather than a merged
+    # bump. The reason is a property of the dependency, so the ignore is too.
+    #
+    # Major only. A 3.5.x release still arrives, which is where a fix would
+    # come from.
+    ignore:
+      - dependency-name: pyspark
+        update-types: ["version-update:semver-major"]
