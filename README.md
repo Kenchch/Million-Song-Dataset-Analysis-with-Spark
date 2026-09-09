@@ -1,5 +1,18 @@
 # Million Song Dataset analysis with PySpark
 
+> **Archived, 9 September 2026.** This repository is read-only and no longer
+> maintained. It began as PySpark coursework and was rebuilt into command-line
+> pipelines with tests; it is kept because the analysis and its results are
+> still reproducible as committed, not because it is current work.
+>
+> `pyspark` stays pinned at 3.5.9. Spark 4 turns ANSI mode on by default, which
+> changes what a malformed cast does in the middle of `clean_triplets` — the
+> upgrade fails this repository's own test suite. Moving to it would mean
+> deciding what the cleaning should do under ANSI and re-running the analysis,
+> and that is not happening here.
+>
+> The maintained portfolio is on [my profile](https://github.com/Kenchch).
+
 [![CI](https://github.com/Kenchch/Million-Song-Dataset-Analysis-with-Spark/actions/workflows/ci.yml/badge.svg)](https://github.com/Kenchch/Million-Song-Dataset-Analysis-with-Spark/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
